@@ -1,6 +1,8 @@
 # FrameSize
 
-Sets a window's real buffer size inside Gamescope on the Steam Frame. The window is 1280×720.
+Sets a window's real buffer size inside Gamescope on the Steam Frame.
+
+![FrameSize window, listing Xwayland windows and an Apply actual size control](ui.png)
 
 ## Quick install
 
@@ -11,12 +13,6 @@ curl -fsSL https://raw.githubusercontent.com/Skillfur/FrameSize/HEAD/install.sh 
 ```
 
 That downloads the latest static AArch64 build into `~/Applications/FrameSize` and adds an application menu entry. Run it again to update. Start FrameSize from the menu, or add `~/Applications/FrameSize` to Steam as a non-Steam game so Gaming Mode can launch it.
-
-## Gaming Mode
-
-A static AArch64 program with its own 1280×720 window. It drains every pending click before painting, so input does not fall behind the redraw.
-
-![FrameSize window, listing Xwayland windows and an Apply actual size control](ui.png)
 
 ## What it sends
 
@@ -37,5 +33,3 @@ Desktop Mode is only needed for the install. After that, FrameSize talks to the 
 ~/Applications/FrameSize --resize-name portal 1920 1080
 ~/Applications/FrameSize --xwayland 1920 1080
 ```
-
-Wayland-native clients are not listed. Gamescope does not expose an external resize protocol for them. X11 and Proton windows are.
