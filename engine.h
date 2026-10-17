@@ -36,9 +36,14 @@ typedef struct {
 } Atoms;
 
 typedef struct {
-    XConn *x;
-    Atoms atom;
+    XConn *x;       /* display the FrameSize window lives on */
+    XConn *ctl;     /* display whose windows we list and resize */
+    Atoms atom;     /* atoms on x */
+    Atoms ctl_atom; /* atoms on ctl, when ctl is a different server */
     int atoms_ready;
+    char home_display[64];
+    char pending_display[32];
+    int switch_server;
     WinInfo wins[96];
     int nwins;
     int selected;
@@ -96,8 +101,15 @@ int scan_windows(App *a);
 void reapply_pin(App *a);
 int find_displays(App *a);
 
-/* Connect a->display. On failure the message is in a->status and a->x is NULL. */
+/* Connect a->display for the FrameSize window. On failure a->x is NULL. */
 int fr_xconnect(App *a);
+/* Point window listing at display without moving the FrameSize window.
+   Returns 0 on success. On failure a->display is unchanged and a->status explains it. */
+int fr_retarget(App *a, const char *display);
+/* Close a foreign listing connection and point the list back at the window's server. */
+void fr_drop_foreign(App *a);
+/* Local fake-server check for nested-desktop auth. Returns 0 on success. */
+int fr_test_foreign(void);
 
 #ifdef __cplusplus
 }

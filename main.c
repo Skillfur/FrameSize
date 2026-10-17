@@ -253,7 +253,7 @@ static void ui_draw(App *a) {
     fill_rect(a, 0, 63, a->fb_w, 1, C_LINE);
     draw_text(a, font_bold, font_bold_alpha, 18, 12, C_TEXT, "FrameSize");
     draw_text(a, font_ui, font_ui_alpha, 18, 34, C_MUTED,
-              "Writes a fixed size hint and ConfigureWindow.");
+              "Resize GameMode windows with ease.");
 
     char disp[96];
     snprintf(disp, sizeof disp, "%s", a->display[0] ? a->display : ":0");
@@ -497,14 +497,34 @@ static void on_hot(App *a, int id) {
         return;
     }
     if (id == HOT_DISPLAY) {
+        find_displays(a);
         if (a->ndisplays > 1) {
             int cur = 0;
+            const char *from = a->pending_display[0] ? a->pending_display : a->display;
             for (int i = 0; i < a->ndisplays; i++) {
-                if (strcmp(a->displays[i], a->display) == 0) cur = i;
+                if (strcmp(a->displays[i], from) == 0) cur = i;
             }
-            snprintf(a->display, sizeof a->display, "%s", a->displays[(cur + 1) % a->ndisplays]);
-            set_status(a, 0, "Display changed - reconnecting.");
-            a->pressed = -2; /* signal reconnect */
+            const char *next = a->displays[(cur + 1) % a->ndisplays];
+            snprintf(a->pending_display, sizeof a->pending_display, "%s", next);
+            if (fr_retarget(a, next) == 0) {
+                a->pending_display[0] = 0;
+                if (scan_windows(a) < 0) {
+                    fr_drop_foreign(a);
+                    scan_windows(a);
+                    fill_fields_from_selection(a);
+                    set_status(a, 2, "Could not list that server. Staying on the original.");
+                } else {
+                    fill_fields_from_selection(a);
+                    char msg[96];
+                    snprintf(msg, sizeof msg, "Changing Server to %s.",
+                             a->display[0] ? a->display : next);
+                    set_status(a, 0, msg);
+                    if (getenv("FR_DEBUG")) {
+                        fprintf(stderr, "server %s windows %d first %s\n", a->display, a->nwins,
+                                a->nwins ? a->wins[0].title : "-");
+                    }
+                }
+            }
         }
         return;
     }
@@ -634,6 +654,9 @@ static int gui_connect(App *a) {
         return -1;
     }
     if (open_gui_window(a) < 0) return -1;
+    snprintf(a->home_display, sizeof a->home_display, "%s", a->display);
+    a->ctl = a->x;
+    a->ctl_atom = a->atom;
     scan_windows(a);
     fill_fields_from_selection(a);
     if (!a->status[0])
@@ -711,6 +734,10 @@ static void motion_at(App *a, int x, int y, int *dirty) {
 
 static int handle_gui_event(App *a, const XEvent *ev, int *dirty) {
     int type = ev->type & 0x7f;
+    if (getenv("FR_DEBUG") && (type == 4 || type == 5))
+        fprintf(stderr, "btn %d detail %u xy %d %d\n", type, ev->detail,
+                (int)(int16_t)(ev->raw[24] | (ev->raw[25] << 8)),
+                (int)(int16_t)(ev->raw[26] | (ev->raw[27] << 8)));
     if (type == 4) {
         a->mouse_x = (int16_t)(ev->raw[24] | (ev->raw[25] << 8));
         a->mouse_y = (int16_t)(ev->raw[26] | (ev->raw[27] << 8));
@@ -735,7 +762,6 @@ static int handle_gui_event(App *a, const XEvent *ev, int *dirty) {
         }
         a->pressed = 0;
         *dirty = 1;
-        if (strncmp(a->status, "Display changed", 15) == 0) return 1;
     } else if (type == 6) {
         motion_at(a,
                   (int16_t)(ev->raw[24] | (ev->raw[25] << 8)),
@@ -791,11 +817,16 @@ static int run_gui(App *a) {
             if (!soon) {
                 ui_draw(a);
                 if (present(a) < 0) {
-                    fprintf(stderr, "present failed: %s\n", a->x->err);
-                    break;
+                    fprintf(stderr, "present failed: %s\n", a->x && a->x->err[0] ? a->x->err : "unknown");
+                    if (!a->x || a->x->fd < 0 || a->x->broken ||
+                        (a->x->err[0] && strstr(a->x->err, "closed")))
+                        break;
+                    set_status(a, 2, "Redraw failed. The window is still open.");
+                    dirty = 0;
+                } else {
+                    last_present = now_ms();
+                    dirty = 0;
                 }
-                last_present = now_ms();
-                dirty = 0;
             }
         }
         t = now_ms();
@@ -811,7 +842,6 @@ static int run_gui(App *a) {
         XEvent ev;
         int got = x_poll(a->x, &ev, wait);
         if (got < 0) break;
-        int reconnect = 0;
         while (got > 0) {
             int act = handle_gui_event(a, &ev, &dirty);
             if (act == 2) {
@@ -820,28 +850,24 @@ static int run_gui(App *a) {
                 alive = 0;
                 break;
             }
-            if (act == 1) {
-                reconnect = 1;
-                break;
-            }
             got = x_poll(a->x, &ev, 0);
             if (got < 0) { alive = 0; break; }
         }
         if (!alive) break;
-        if (reconnect || strncmp(a->status, "Display changed", 15) == 0) {
-            if (gui_connect(a) < 0) return 1;
-            set_status(a, 0, "Connected to the other Xwayland.");
-            dirty = 1;
-            last_scan = now_ms();
-            continue;
-        }
         t = now_ms();
         if (t - last_scan >= 2500) {
             uint32_t before = list_sig(a);
-            scan_windows(a);
-            read_root_meta(a);
+            if (scan_windows(a) < 0 && a->ctl && a->ctl != a->x) {
+                fr_drop_foreign(a);
+                scan_windows(a);
+                read_root_meta(a);
+                set_status(a, 2, "Lost that server. Back on the one this window was opened on.");
+                dirty = 1;
+            } else {
+                read_root_meta(a);
+                if (list_sig(a) != before) dirty = 1;
+            }
             last_scan = now_ms();
-            if (list_sig(a) != before) dirty = 1;
         }
         if (a->pin && a->pin_id && t - last_pin >= 1000) {
             reapply_pin(a);
@@ -1140,6 +1166,8 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) {
             mode = "screenshot";
             shot = argv[++i];
+        } else if (!strcmp(argv[i], "--test-foreign")) {
+            mode = "test-foreign";
         } else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
             usage();
@@ -1147,6 +1175,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!strcmp(mode, "screenshot")) return screenshot(shot);
+    if (!strcmp(mode, "test-foreign")) return fr_test_foreign();
     if (!strcmp(mode, "self-check")) return self_check(display ? display : getenv("DISPLAY"));
     if (!strcmp(mode, "probe")) return probe_window(display ? display : getenv("DISPLAY"));
     if (!strcmp(mode, "test-wm")) return test_wm(display ? display : getenv("DISPLAY"));
@@ -1161,6 +1190,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "gui")) {
         if (display) snprintf(a.display, sizeof a.display, "%s", display);
         int rc = run_gui(&a);
+        fr_drop_foreign(&a);
         if (a.x) x_disconnect(a.x);
         free(a.x);
         free(a.fb);

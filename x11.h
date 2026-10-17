@@ -41,9 +41,19 @@ struct XConn {
     int last_error;
     uint16_t last_error_seq;
     char last_error_text[80];
+    /* When set, reads and writes on this connection also drain `yield`
+       so a second X server cannot fill its socket and stall us. */
+    struct XConn *yield;
+    int broken;
 };
 
 int x_connect(XConn *c, const char *display);
+/* Like x_connect. If authority is non-NULL, that file is the only cookie
+   source and the call fails without touching the socket when it has no
+   cookie for this display. NULL uses XAUTHORITY / ~/.Xauthority, and
+   falls back to an empty handshake (Gamescope often has no cookie). */
+int x_connect_auth(XConn *c, const char *display, const char *authority);
+int x_authority_has_cookie(const char *path, const char *display);
 void x_disconnect(XConn *c);
 uint32_t x_id(XConn *c);
 

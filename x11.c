@@ -10,41 +10,12 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <poll.h>
 
 static void set_err(XConn *c, const char *msg) {
     snprintf(c->err, sizeof c->err, "%s", msg);
-}
-
-static int write_full(int fd, const void *buf, size_t n) {
-    const uint8_t *p = buf;
-    size_t off = 0;
-    while (off < n) {
-        ssize_t w = write(fd, p + off, n - off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (w == 0) return -1;
-        off += (size_t)w;
-    }
-    return 0;
-}
-
-static int read_full(int fd, void *buf, size_t n) {
-    uint8_t *p = buf;
-    size_t off = 0;
-    while (off < n) {
-        ssize_t r = read(fd, p + off, n - off);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (r == 0) return -1;
-        off += (size_t)r;
-    }
-    return 0;
 }
 
 /* Pull every byte already queued by the server into c->in. Safe on a blocking
@@ -72,14 +43,22 @@ static int buffer_readable(XConn *c) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             set_err(c, "read failed");
+            c->broken = 1;
             return -1;
         }
         if (r == 0) {
             set_err(c, "display connection closed");
+            c->broken = 1;
             return -1;
         }
         c->in_len += (size_t)r;
     }
+}
+
+static void drain_other(XConn *c) {
+    XConn *o = (c && c->yield && c->yield != c) ? c->yield : NULL;
+    if (!o || o->broken || o->fd < 0 || o->fd == c->fd) return;
+    buffer_readable(o);
 }
 
 /* A blocking PutImage fills the send buffer while Gamescope is still writing
@@ -89,6 +68,7 @@ static int write_request(XConn *c, const void *buf, size_t n) {
     const uint8_t *p = buf;
     size_t off = 0;
     while (off < n) {
+        drain_other(c);
         if (buffer_readable(c) < 0) return -1;
         struct pollfd pfd = { .fd = c->fd, .events = POLLOUT | POLLIN };
         int pr = poll(&pfd, 1, 5000);
@@ -103,6 +83,7 @@ static int write_request(XConn *c, const void *buf, size_t n) {
         }
         if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
             set_err(c, "display connection closed");
+            c->broken = 1;
             return -1;
         }
         if (pfd.revents & POLLIN) {
@@ -113,10 +94,12 @@ static int write_request(XConn *c, const void *buf, size_t n) {
         if (w < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             set_err(c, "write to display failed");
+            c->broken = 1;
             return -1;
         }
         if (w == 0) {
             set_err(c, "write to display failed");
+            c->broken = 1;
             return -1;
         }
         off += (size_t)w;
@@ -124,18 +107,47 @@ static int write_request(XConn *c, const void *buf, size_t n) {
     return 0;
 }
 
+static int ms_since(const struct timespec *start) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int)((now.tv_sec - start->tv_sec) * 1000 + (now.tv_nsec - start->tv_nsec) / 1000000);
+}
+
 static int ensure_in(XConn *c, size_t need, int timeout_ms) {
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     while (c->in_len < need) {
-        struct pollfd pfd = { .fd = c->fd, .events = POLLIN };
-        int pr = poll(&pfd, 1, timeout_ms);
+        if (c->broken || c->fd < 0) return -1;
+        drain_other(c);
+        struct pollfd pfd[2];
+        pfd[0].fd = c->fd;
+        pfd[0].events = POLLIN;
+        pfd[0].revents = 0;
+        int np = 1;
+        if (c->yield && c->yield != c && !c->yield->broken && c->yield->fd >= 0 && c->yield->fd != c->fd) {
+            pfd[1].fd = c->yield->fd;
+            pfd[1].events = POLLIN;
+            pfd[1].revents = 0;
+            np = 2;
+        }
+        int wait = timeout_ms;
+        if (timeout_ms >= 0) {
+            int elapsed = ms_since(&start);
+            wait = timeout_ms - elapsed;
+            if (wait < 0) wait = 0;
+        }
+        int pr = poll(pfd, (nfds_t)np, wait);
         if (pr < 0) {
             if (errno == EINTR) continue;
             set_err(c, "poll failed");
             return -1;
         }
         if (pr == 0) return 1;
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL) && !(pfd.revents & POLLIN)) {
+        if (np == 2 && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR))) drain_other(c);
+        if (!(pfd[0].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) continue;
+        if (pfd[0].revents & (POLLERR | POLLHUP | POLLNVAL) && !(pfd[0].revents & POLLIN)) {
             set_err(c, "display connection closed");
+            c->broken = 1;
             return -1;
         }
         if (c->in_len + 4096 > c->in_cap) {
@@ -151,10 +163,12 @@ static int ensure_in(XConn *c, size_t need, int timeout_ms) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
             set_err(c, "read failed");
+            c->broken = 1;
             return -1;
         }
         if (r == 0) {
             set_err(c, "display connection closed");
+            c->broken = 1;
             return -1;
         }
         c->in_len += (size_t)r;
@@ -253,6 +267,7 @@ static int pull(XConn *c, uint16_t want_seq, int timeout_ms, uint8_t **reply, si
 }
 
 static int request(XConn *c, uint8_t *req, size_t n, uint8_t **reply, size_t *reply_len, int expect_reply) {
+    if (!c || c->broken || c->fd < 0) return -1;
     if (n < 4 || (n & 3)) {
         set_err(c, "bad request size");
         return -1;
@@ -301,15 +316,8 @@ static int parse_display(const char *display, char *host, size_t hostn, int *num
     return 0;
 }
 
-static int load_cookie(int dpy_num, uint8_t cookie[16]) {
-    const char *path = getenv("XAUTHORITY");
-    char buf[256];
-    if (!path || !path[0]) {
-        const char *home = getenv("HOME");
-        if (!home) return -1;
-        snprintf(buf, sizeof buf, "%s/.Xauthority", home);
-        path = buf;
-    }
+static int load_cookie_file(const char *path, int dpy_num, uint8_t cookie[16]) {
+    if (!path || !path[0]) return -1;
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     char num[16];
@@ -337,7 +345,7 @@ static int load_cookie(int dpy_num, uint8_t cookie[16]) {
         }
         if (fread(hdr, 1, 2, f) != 2) { free(addr); free(dnum); free(name); break; }
         unsigned dlen = ((unsigned)hdr[0] << 8) | hdr[1];
-        uint8_t *data = calloc(1, dlen + 1);
+        uint8_t *data = calloc(1, dlen ? dlen : 1);
         if (!data) { free(addr); free(dnum); free(name); fclose(f); return -1; }
         if (dlen && fread(data, 1, dlen, f) != dlen) {
             free(addr); free(dnum); free(name); free(data); break;
@@ -356,6 +364,18 @@ static int load_cookie(int dpy_num, uint8_t cookie[16]) {
     }
     fclose(f);
     return -1;
+}
+
+static int load_cookie(int dpy_num, uint8_t cookie[16]) {
+    const char *path = getenv("XAUTHORITY");
+    char buf[256];
+    if (!path || !path[0]) {
+        const char *home = getenv("HOME");
+        if (!home) return -1;
+        snprintf(buf, sizeof buf, "%s/.Xauthority", home);
+        path = buf;
+    }
+    return load_cookie_file(path, dpy_num, cookie);
 }
 
 static int connect_tcp(int num, const char *host) {
@@ -377,12 +397,67 @@ static int connect_tcp(int num, const char *host) {
     return fd;
 }
 
+/* Returns 0, -1 on error, -2 on timeout. */
+static int io_deadline(int fd, void *buf, size_t n, int timeout_ms, int writing) {
+    uint8_t *p = buf;
+    size_t off = 0;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (off < n) {
+        int left = timeout_ms - ms_since(&start);
+        if (left <= 0) return -2;
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = writing ? POLLOUT : POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, left);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (pr == 0) return -2;
+        ssize_t r = writing ? write(fd, p + off, n - off) : read(fd, p + off, n - off);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return -1;
+        }
+        if (r == 0) return -1;
+        off += (size_t)r;
+    }
+    return 0;
+}
+
+int x_authority_has_cookie(const char *path, const char *display) {
+    if (!path || !path[0] || !display) return 0;
+    char host[128];
+    int num = 0;
+    parse_display(display, host, sizeof host, &num);
+    uint8_t cookie[16];
+    return load_cookie_file(path, num, cookie) == 0;
+}
+
 int x_connect(XConn *c, const char *display) {
+    return x_connect_auth(c, display, NULL);
+}
+
+int x_connect_auth(XConn *c, const char *display, const char *authority) {
     memset(c, 0, sizeof *c);
     c->fd = -1;
     char host[128];
     int num = 0;
     parse_display(display, host, sizeof host, &num);
+    uint8_t cookie[16];
+    int have = 0;
+    if (authority && authority[0]) {
+        if (load_cookie_file(authority, num, cookie) != 0) {
+            set_err(c, "no cookie for this display");
+            return -1;
+        }
+        have = 1;
+    } else {
+        have = load_cookie(num, cookie) == 0;
+    }
     snprintf(c->err, sizeof c->err, "connecting");
 
     int fd = -1;
@@ -407,8 +482,6 @@ int x_connect(XConn *c, const char *display) {
     }
     c->fd = fd;
 
-    uint8_t cookie[16];
-    int have = load_cookie(num, cookie) == 0;
     const char *aname = "MIT-MAGIC-COOKIE-1";
     uint16_t nlen = have ? 18 : 0;
     uint16_t dlen = have ? 16 : 0;
@@ -426,33 +499,44 @@ int x_connect(XConn *c, const char *display) {
         memcpy(hello + 12, aname, 18);
         memcpy(hello + 12 + nlen + npad, cookie, 16);
     }
-    if (write_full(fd, hello, total) < 0) {
-        free(hello);
-        set_err(c, "handshake write failed");
+    int wr = io_deadline(fd, hello, total, 2000, 1);
+    free(hello);
+    if (wr < 0) {
+        set_err(c, wr == -2 ? "display handshake timed out" : "handshake write failed");
         return -1;
     }
-    free(hello);
 
     uint8_t hdr[8];
-    if (read_full(fd, hdr, 8) < 0) { set_err(c, "handshake read failed"); return -1; }
+    int rr = io_deadline(fd, hdr, 8, 2000, 0);
+    if (rr < 0) {
+        set_err(c, rr == -2 ? "display handshake timed out" : "handshake read failed");
+        return -1;
+    }
     if (hdr[0] != 1) {
-        uint16_t reason_len = (uint16_t)(hdr[1]);
-        (void)reason_len;
         uint16_t add = get_u16(hdr + 6);
+        if (add > 2048) add = 2048;
         if (add) {
             uint8_t *junk = calloc(1, (size_t)add * 4);
-            if (junk) { read_full(fd, junk, (size_t)add * 4); free(junk); }
+            if (junk) {
+                io_deadline(fd, junk, (size_t)add * 4, 2000, 0);
+                free(junk);
+            }
         }
         set_err(c, hdr[0] == 0 ? "X server refused the connection (auth)" : "unexpected handshake");
         return -1;
     }
     uint16_t add = get_u16(hdr + 6);
     size_t extra_n = (size_t)add * 4;
+    if (extra_n > 1024 * 1024) {
+        set_err(c, "setup too large");
+        return -1;
+    }
     uint8_t *extra = calloc(1, extra_n + 1);
     if (!extra) { set_err(c, "out of memory"); return -1; }
-    if (read_full(fd, extra, extra_n) < 0) {
+    rr = io_deadline(fd, extra, extra_n, 2000, 0);
+    if (rr < 0) {
         free(extra);
-        set_err(c, "setup read failed");
+        set_err(c, rr == -2 ? "display handshake timed out" : "setup read failed");
         return -1;
     }
     if (getenv("FR_DEBUG")) {
@@ -570,11 +654,22 @@ int x_connect(XConn *c, const char *display) {
 
 void x_disconnect(XConn *c) {
     if (!c) return;
+    if (c->yield) {
+        if (c->yield->yield == c) c->yield->yield = NULL;
+        c->yield = NULL;
+    }
     if (c->fd >= 0) close(c->fd);
     free(c->in);
     free(c->eq);
     free(c->keysyms);
+    c->in = NULL;
+    c->eq = NULL;
+    c->keysyms = NULL;
+    c->in_len = c->in_cap = 0;
+    c->eq_len = c->eq_cap = 0;
+    c->nkeysyms = 0;
     c->fd = -1;
+    c->broken = 1;
 }
 
 uint32_t x_id(XConn *c) {
@@ -598,6 +693,7 @@ static int expect(XConn *c, uint8_t opcode, uint8_t data, const uint8_t *rest, s
 }
 
 uint32_t x_intern(XConn *c, const char *name) {
+    if (!c || c->fd < 0 || c->broken || !name) return 0;
     size_t len = strlen(name);
     if (len > 65535) len = 65535;
     uint8_t *body = calloc(1, 4 + len);
