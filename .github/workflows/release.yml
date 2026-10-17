@@ -1,0 +1,83 @@
+name: Release
+run-name: Publish FrameSize release
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to publish (a successful Build must already exist for this commit)
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Download build artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --commit "$GITHUB_SHA" --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+            if [ -z "$id" ] || [ "$id" = "null" ]; then
+              echo "No successful Build run for $GITHUB_SHA. Run the Build workflow first."
+              exit 1
+            fi
+          else
+            id="${{ github.event.workflow_run.id }}"
+            repo="${{ github.event.workflow_run.head_repository.full_name }}"
+            if [ "$repo" != "$GITHUB_REPOSITORY" ]; then
+              echo "Ignoring a build from $repo"
+              echo "skip" > "$GITHUB_ENV"
+              exit 0
+            fi
+          fi
+          gh run download "$id" --repo "$GITHUB_REPOSITORY" --name FrameSize-aarch64 --dir dist
+
+      - name: Create GitHub release
+        if: env.skip != 'skip'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          BUILD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag=$(tr -d '[:space:]' < dist/release-tag.txt || true)
+          fi
+          if [ -z "$tag" ]; then
+            echo "This build was not for a tag. Nothing to publish."
+            exit 0
+          fi
+          rm -f dist/release-tag.txt
+          cat > notes.md << EOF
+          FrameSize $tag for aarch64 Linux (Steam Frame).
+
+          Install or update on the Steam Frame, in Desktop Mode, from a terminal:
+
+              curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/HEAD/install.sh | bash
+
+          That installs \`~/Applications/FrameSize\`. Add it to Steam as a non-Steam game to launch it from Gaming Mode.
+          EOF
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" dist/FrameSize-aarch64 dist/FrameSize-aarch64.sha256 \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/FrameSize-aarch64 dist/FrameSize-aarch64.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$BUILD_SHA" \
+              --title "FrameSize $tag" \
+              --notes-file notes.md
+          fi
