@@ -33,3 +33,7 @@ Desktop Mode is only needed for the install. After that, FrameSize talks to the 
 ~/Applications/FrameSize --resize-name portal 1920 1080
 ~/Applications/FrameSize --xwayland 1920 1080
 ```
+
+## Disclosure
+
+The code in this repository was developed with the assistance of an LLM.
