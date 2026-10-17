@@ -440,8 +440,21 @@ static int alloc_fb(App *a, int w, int h) {
 }
 
 static int present(App *a) {
-    if (!a->x || !a->our_win || !a->gc) return 0;
-    return x_put_image(a->x, a->our_win, a->gc, 0, 0, a->fb_w, a->fb_h, a->fb);
+    if (!a->x || !a->our_win || !a->gc || !a->fb) return 0;
+    if (a->pixmap && (a->pixmap_w != a->fb_w || a->pixmap_h != a->fb_h)) {
+        x_free_pixmap(a->x, a->pixmap);
+        a->pixmap = 0;
+    }
+    if (!a->pixmap) {
+        a->pixmap = x_create_pixmap(a->x, a->our_win, a->fb_w, a->fb_h);
+        if (!a->pixmap) return -1;
+        a->pixmap_w = a->fb_w;
+        a->pixmap_h = a->fb_h;
+    }
+    /* Gamescope scans out Xwayland when a blit damages the window. PutImage
+       alone updates the pixmap and the Frame stays black. */
+    if (x_put_image(a->x, a->pixmap, a->gc, 0, 0, a->fb_w, a->fb_h, a->fb) < 0) return -1;
+    return x_copy_area(a->x, a->pixmap, a->our_win, a->gc, a->fb_w, a->fb_h);
 }
 
 static void type_digit(App *a, int digit) {
@@ -553,6 +566,27 @@ static void on_hot(App *a, int id) {
     if (!a->pin) a->pin_id = 0;
 }
 
+static int write_ui_hints(XConn *x, uint32_t win, int w, int h) {
+    int32_t f[18];
+    memset(f, 0, sizeof f);
+    /* USPosition | USSize | PMinSize | PBaseSize. Not min=max: Gamescope treats
+       a locked hint as a game buffer and shows black until that buffer is presented. */
+    f[0] = (1 << 0) | (1 << 1) | (1 << 4) | (1 << 8);
+    f[1] = 48;
+    f[2] = 48;
+    f[3] = w;
+    f[4] = h;
+    f[5] = 640;
+    f[6] = 360;
+    f[9] = 1;
+    f[10] = 1;
+    f[15] = w;
+    f[16] = h;
+    uint8_t raw[18 * 4];
+    for (int i = 0; i < 18; i++) put32(raw + i * 4, (uint32_t)f[i]);
+    return x_change_property(x, win, XA_WM_NORMAL_HINTS_, XA_WM_SIZE_HINTS_, 32, raw, 18);
+}
+
 static int open_gui_window(App *a) {
     int ww = 1280, hh = 720;
     if (alloc_fb(a, ww, hh) < 0) return -1;
@@ -562,6 +596,7 @@ static int open_gui_window(App *a) {
         fprintf(stderr, "create window failed: %s\n", a->x->err);
         return -1;
     }
+    x_change_attr(a->x, a->our_win, 0x1u, 0);
     const char *title = "FrameSize";
     x_change_property(a->x, a->our_win, XA_WM_NAME_, XA_STRING_, 8, title, (uint32_t)strlen(title));
     if (a->atom.net_wm_name && a->atom.utf8)
@@ -576,10 +611,16 @@ static int open_gui_window(App *a) {
         put32(proto, a->atom.wm_delete);
         x_change_property(a->x, a->our_win, a->atom.protocols, XA_ATOM_, 32, proto, 1);
     }
-    write_fixed_hints(a->x, a->our_win, ww, hh);
+    if (a->atom.wintype && a->atom.wintype_normal) {
+        uint8_t ty[4];
+        put32(ty, a->atom.wintype_normal);
+        x_change_property(a->x, a->our_win, a->atom.wintype, XA_ATOM_, 32, ty, 1);
+    }
+    write_ui_hints(a->x, a->our_win, ww, hh);
     a->gc = x_create_gc(a->x, a->our_win, a->x->white);
     if (!a->gc) return -1;
     if (x_map(a->x, a->our_win) < 0) return -1;
+    x_roundtrip(a->x);
     /* Do not select SubstructureNotify on the root. Gamescope emits a
        ConfigureNotify for managed windows many times a second, and handling
        those one redraw at a time is what made clicks fall further behind. */
@@ -710,19 +751,13 @@ static int handle_gui_event(App *a, const XEvent *ev, int *dirty) {
         if (win == a->our_win) {
             int nw = (int)(ev->raw[20] | (ev->raw[21] << 8));
             int nh = (int)(ev->raw[22] | (ev->raw[23] << 8));
-            if (nw > 0 && nh > 0 && (nw != 1280 || nh != 720)) {
-                uint64_t now = now_ms();
-                static uint64_t last_fix;
-                if (now - last_fix > 500) {
-                    last_fix = now;
-                    x_configure(a->x, a->our_win, 0x000c, 0, 0, 1280, 720);
-                }
+            if (nw > 0 && nh > 0 && (nw != a->fb_w || nh != a->fb_h)) {
+                if (alloc_fb(a, nw, nh) == 0) *dirty = 1;
             }
         }
     } else if (type == 12) {
         uint32_t win = get32(ev->raw + 4);
-        int count = (int)(ev->raw[16] | (ev->raw[17] << 8));
-        if (win == a->our_win && count == 0) *dirty = 1;
+        if (win == a->our_win) *dirty = 1;
     } else if (type == 33 || type == 17) {
         uint32_t win = get32(ev->raw + (type == 17 ? 8 : 4));
         if (win == a->our_win) {

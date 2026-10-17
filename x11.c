@@ -548,6 +548,8 @@ int x_connect(XConn *c, const char *display) {
         if (foff + 8 > extra_n) break;
         if (extra[foff] == c->depth) {
             c->bpp = extra[foff + 1];
+            uint8_t spad = extra[foff + 2];
+            if (spad == 8 || spad == 16 || spad == 32) c->scanline_pad = spad;
             break;
         }
         foff += 8;
@@ -798,6 +800,35 @@ uint32_t x_create_gc(XConn *c, uint32_t drawable, uint32_t fg) {
     put_u32(body + 12, fg);
     if (expect(c, 55, 0, body, 16, NULL, NULL) < 0) return 0;
     return id;
+}
+
+uint32_t x_create_pixmap(XConn *c, uint32_t drawable, int w, int h) {
+    if (w < 1 || h < 1) return 0;
+    uint32_t id = x_id(c);
+    uint8_t body[12];
+    put_u32(body, id);
+    put_u32(body + 4, drawable);
+    put_u16(body + 8, (uint16_t)w);
+    put_u16(body + 10, (uint16_t)h);
+    if (expect(c, 53, c->depth ? c->depth : 24, body, 12, NULL, NULL) < 0) return 0;
+    return id;
+}
+
+int x_free_pixmap(XConn *c, uint32_t pixmap) {
+    uint8_t body[4];
+    put_u32(body, pixmap);
+    return expect(c, 54, 0, body, 4, NULL, NULL);
+}
+
+int x_copy_area(XConn *c, uint32_t src, uint32_t dst, uint32_t gc, int w, int h) {
+    uint8_t body[24];
+    memset(body, 0, sizeof body);
+    put_u32(body + 0, src);
+    put_u32(body + 4, dst);
+    put_u32(body + 8, gc);
+    put_u16(body + 20, (uint16_t)w);
+    put_u16(body + 22, (uint16_t)h);
+    return expect(c, 62, 0, body, 24, NULL, NULL);
 }
 
 static uint32_t spread(uint8_t v, uint32_t mask) {

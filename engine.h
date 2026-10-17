@@ -32,6 +32,7 @@ typedef struct {
     uint32_t net_wm_name, utf8, pid, state, fullscreen, moveresize;
     uint32_t mode, server, scale;
     uint32_t protocols, wm_delete;
+    uint32_t wintype, wintype_normal;
 } Atoms;
 
 typedef struct {
@@ -67,6 +68,8 @@ typedef struct {
     int fb_w, fb_h;
     uint32_t our_win;
     uint32_t gc;
+    uint32_t pixmap;
+    int pixmap_w, pixmap_h;
     Hot hots[96];
     int nhots;
     int hover;

@@ -49,6 +49,8 @@ int ensure_atoms(App *a) {
     a->atom.scale = x_intern(a->x, "STEAM_SCREEN_SCALE");
     a->atom.protocols = x_intern(a->x, "WM_PROTOCOLS");
     a->atom.wm_delete = x_intern(a->x, "WM_DELETE_WINDOW");
+    a->atom.wintype = x_intern(a->x, "_NET_WM_WINDOW_TYPE");
+    a->atom.wintype_normal = x_intern(a->x, "_NET_WM_WINDOW_TYPE_NORMAL");
     a->atoms_ready = 1;
     return 0;
 }
@@ -375,6 +377,9 @@ int fr_xconnect(App *a) {
     a->atoms_ready = 0;
     a->our_win = 0;
     a->gc = 0;
+    a->pixmap = 0;
+    a->pixmap_w = 0;
+    a->pixmap_h = 0;
     if (!a->display[0]) {
         set_status(a, 2, "No display name.");
         return -1;
